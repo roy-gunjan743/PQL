@@ -2,6 +2,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 from random import Random
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 
@@ -36,6 +38,21 @@ class Context:
         self._on_marker = on_marker
         self._begun = []
         self._acknowledged = []
+        self.allow_concurrent = False
+        self._ticks = 0
+
+    def connect(self, readonly=False):
+        mode = "ro" if readonly else "rw"
+        db = sqlite3.connect(self.db.as_uri() + f"?mode={mode}", uri=True)
+        db.execute("PRAGMA foreign_keys=ON")
+        return db
+
+    def now(self):
+        self._ticks += 1
+        return datetime(2000, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=self.seed + self._ticks)
+
+    def new_id(self):
+        return f"{self.random.getrandbits(128):032x}"
 
     @property
     def history(self):
@@ -44,6 +61,8 @@ class Context:
     def begin(self, ordinal: int):
         if type(ordinal) is not int or ordinal < 0 or ordinal in self._begun:
             raise ValueError("begin requires a new non-negative integer ordinal")
+        if not self.allow_concurrent and len(self._begun) != len(self._acknowledged):
+            raise ValueError("previous operation must be acknowledged before the next begins")
         self._begun.append(ordinal)
 
     def acknowledge(self, ordinal: int):
