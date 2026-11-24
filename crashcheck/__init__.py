@@ -1,8 +1,11 @@
 """Public scenario API for CrashCheck."""
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from random import Random
 from typing import Callable
+
+__version__ = "0.2.0"
 
 
 @dataclass(frozen=True)
@@ -28,14 +31,45 @@ class History:
 
 
 class Context:
-    def __init__(self, root: Path, seed: int, on_marker: Callable | None = None):
+    """Per-worker handle given to scenario hooks.
+
+    ``strict_ordering`` enforces the default oracle contract: an operation may begin
+    only after the previous one was acknowledged, so at most one terminal operation is
+    in flight at any cut. A scenario opts out with ``STRICT_ORDERING = False``.
+    """
+    CLOCK_EPOCH = 1_700_000_000.0
+
+    def __init__(self, root: Path, seed: int, on_marker: Callable | None = None,
+                 strict_ordering: bool = True):
         self.root = root
         self.db = root / "app.sqlite"
         self.seed = seed
         self.random = Random(seed)
+        self.strict_ordering = strict_ordering
         self._on_marker = on_marker
         self._begun = []
         self._acknowledged = []
+        self._ticks = 0
+        self._ids = 0
+
+    def connect(self, readonly: bool = False, foreign_keys: bool = True):
+        """Connection factory. Use ``readonly=True`` inside ``observe``."""
+        if readonly:
+            db = sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True)
+        else:
+            db = sqlite3.connect(self.db)
+        db.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
+        return db
+
+    def now(self) -> float:
+        """Deterministic clock: one simulated second per call, offset by the seed."""
+        self._ticks += 1
+        return self.CLOCK_EPOCH + self.seed + self._ticks
+
+    def new_id(self, prefix: str = "id") -> str:
+        """Deterministic identifier generator."""
+        self._ids += 1
+        return f"{prefix}-{self.seed}-{self._ids:06d}"
 
     @property
     def history(self):
@@ -44,6 +78,9 @@ class Context:
     def begin(self, ordinal: int):
         if type(ordinal) is not int or ordinal < 0 or ordinal in self._begun:
             raise ValueError("begin requires a new non-negative integer ordinal")
+        if self.strict_ordering and set(self._begun) - set(self._acknowledged):
+            raise ValueError("begin requires the previous operation to be acknowledged "
+                             "(set STRICT_ORDERING = False to allow overlap)")
         self._begun.append(ordinal)
 
     def acknowledge(self, ordinal: int):
