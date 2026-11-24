@@ -9,7 +9,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import CheckFailure, Context, History
-from .evidence import canonical, failure, inconclusive, read_json, write_json
+from .evidence import (canonical, check_result, failure, fingerprint, inconclusive,
+                       inventory, read_json, write_json)
 
 CUT_EXIT = 77
 
@@ -22,37 +23,96 @@ def load_module(path, name):
     return module
 
 
-def verify(scenario, ctx, history):
+def integrity_stage(scenario, ctx, checks, fail, ok, label=""):
+    """Open the candidate, force journal recovery, run integrity and foreign-key checks."""
     # mode=rw allows SQLite journal recovery without creating a missing database.
     try:
         db = sqlite3.connect(ctx.db.as_uri() + "?mode=rw", uri=True)
         try:
+            db.execute("PRAGMA foreign_keys=ON")
+            # An explicit first read lets SQLite roll back a hot journal before any check.
+            db.execute("SELECT count(*) FROM sqlite_master").fetchall()
+            if not label:
+                ok("open", "sqlite.open")
             rows = [r[0] for r in db.execute("PRAGMA integrity_check")]
             if rows != ["ok"]:
-                return failure("sqlite.integrity", "corruption", "\n".join(rows))
+                return fail("integrity" + label, "sqlite.integrity" + label.replace("-", "_"),
+                            "corruption", "\n".join(rows))
+            ok("integrity" + label, "sqlite.integrity" + label.replace("-", "_"))
+            if getattr(scenario, "CHECK_FOREIGN_KEYS", False):
+                bad = db.execute("PRAGMA foreign_key_check").fetchall()
+                if bad:
+                    return fail("foreign-keys" + label, "sqlite.foreign_keys", "foreign-key",
+                                f"{len(bad)} violation(s), first: {tuple(bad[0])!r}")
+                ok("foreign-keys" + label, "sqlite.foreign_keys")
         finally:
             db.close()
     except sqlite3.DatabaseError as exc:
         code = getattr(exc, "sqlite_errorcode", 0) & 255
         if code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
-            return failure("sqlite.integrity", "corruption", str(exc))
+            return fail("open" if not label else "integrity" + label, "sqlite.integrity",
+                        "corruption", str(exc))
         raise
+    return None
 
+
+def verify(scenario, ctx, history):
+    """Staged verification: open, integrity, foreign keys, app recovery, observe.
+
+    Each stage appends to ``checks``. Open and integrity results are recorded before
+    the application hook runs. Harness errors (anything not a verified finding) raise.
+    """
+    checks = []
+
+    def ok(stage, check_id):
+        checks.append(check_result(stage, check_id, "pass"))
+
+    def fail(stage, check_id, failure_class, message):
+        checks.append(check_result(stage, check_id, "fail", failure_class, message))
+        return failure(check_id, failure_class, message, stage=stage, checks=checks)
+
+    early = integrity_stage(scenario, ctx, checks, fail, ok)
+    if early:
+        return early
+
+    before = fingerprint(inventory(ctx.root))
     if hasattr(scenario, "recover"):
-        scenario.recover(ctx)
+        try:
+            scenario.recover(ctx)
+        except CheckFailure as exc:
+            return fail("app-recovery", exc.check_id, exc.failure_class, str(exc))
+        except Exception as exc:  # the application could not recover this candidate
+            return fail("app-recovery", "app.recovery", "recovery-error",
+                        f"{type(exc).__name__}: {exc}")
+        ok("app-recovery", "app.recovery")
+        after = fingerprint(inventory(ctx.root))
+        if after != before:  # a mutating hook: integrity must hold again
+            early = integrity_stage(scenario, ctx, checks, fail, ok, label="-after-recovery")
+            if early:
+                return early
+            before = fingerprint(inventory(ctx.root))
+
+    finding = None
     try:
         result = scenario.observe(ctx, history)
     except CheckFailure as exc:
-        return failure(exc.check_id, exc.failure_class, str(exc))
+        finding, result = exc, None
+    if fingerprint(inventory(ctx.root)) != before:
+        raise ValueError("observe modified the candidate; it must be read-only "
+                         "(open the database with ctx.connect(readonly=True))")
+    if finding is not None:
+        return fail("observe", finding.check_id, finding.failure_class, str(finding))
     if result is not None:
         raise ValueError("observe must return None or raise CheckFailure")
-    return {"status": "pass"}
+    ok("observe", "app.observe")
+    return {"status": "pass", "checks": checks}
 
 
 def execute(job, reply):
     scenario = load_module(job["scenario"], "crashcheck_scenario")
     root = Path(job["root"])
-    ctx = Context(root, job["seed"])
+    strict = getattr(scenario, "STRICT_ORDERING", True)
+    ctx = Context(root, job["seed"], strict_ordering=strict)
     action = job["action"]
     if action == "setup":
         scenario.setup(ctx)
@@ -74,26 +134,38 @@ def execute(job, reply):
             if action == "cut" and count == job["cut"]["index"]:
                 if canonical(event) != canonical(job["cut"]):
                     raise ValueError("scenario marker sequence diverged from discovery")
+                # The receipt is written atomically before the abrupt exit; the parent
+                # verifies both the receipt and the exit status before freezing files.
                 write_json(reply, {"value": event})
                 os._exit(CUT_EXIT)
-            if action == "discover" and count < job["limit"]:
+            if action == "discover":
                 plan.append(event)
             count += 1
 
-        scenario.run(Context(root, job["seed"], marker))
+        run_ctx = Context(root, job["seed"], marker, strict_ordering=strict)
+        scenario.run(run_ctx)
         if action == "cut":
             raise ValueError("scenario completed before requested marker")
-        return {"items": plan, "total": count}
+        return {"items": plan, "total": count, "final_history": asdict(run_ctx.history)}
     adapter = load_module(job["adapter"], "crashcheck_adapter")
     trace = Path(job["trace"])
     if action == "record":
         adapter.record(scenario, ctx, trace)
         items = list(itertools.islice(adapter.recipes(trace, ctx.seed), job["limit"] + 1))
-        return {"items": items[:job["limit"]], "truncated": len(items) > job["limit"]}
+        return {"items": items[:job["limit"]], "truncated": len(items) > job["limit"],
+                "final_history": asdict(ctx.history)}
     if action == "materialize":
         candidate = adapter.materialize(Path(job["base"]), trace, job["recipe"], root)
         history = History.decode(candidate["history"])
-        return {"cut": candidate["cut"], "history": asdict(history)}
+        value = {"cut": candidate["cut"], "history": asdict(history)}
+        if "effects" in candidate:
+            value["effects"] = candidate["effects"]
+        return value
+    if action == "reductions":
+        if not hasattr(adapter, "reductions"):
+            return {"items": []}
+        items = list(itertools.islice(adapter.reductions(trace, job["recipe"]), job["limit"]))
+        return {"items": items}
     raise ValueError(f"unknown worker action {action}")
 
 

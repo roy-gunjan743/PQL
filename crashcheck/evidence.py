@@ -46,9 +46,20 @@ def fingerprint(entries):
     return hashlib.sha256(canonical(entries)).hexdigest()
 
 
-def failure(check_id, failure_class, message):
-    return {"status": "verified-failure", "check_id": check_id,
-            "failure_class": failure_class, "detail": message}
+def check_result(stage, check_id, status, failure_class=None, detail=""):
+    """One entry of an outcome's per-check list."""
+    return {"stage": stage, "check_id": check_id, "failure_class": failure_class,
+            "status": status, "detail": detail}
+
+
+def failure(check_id, failure_class, message, stage=None, checks=None):
+    outcome = {"status": "verified-failure", "check_id": check_id,
+               "failure_class": failure_class, "detail": message}
+    if stage is not None:
+        outcome["stage"] = stage
+    if checks is not None:
+        outcome["checks"] = checks
+    return outcome
 
 
 def inconclusive(detail):
