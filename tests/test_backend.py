@@ -357,7 +357,7 @@ def observe(ctx, history):
     def test_cli_mode_validation(self):
         self.scenario.write_text(BOOKING, encoding="utf-8")
         cases = (["--mode", "modeled"], ["--mode", "process", "--model", "file-prefix-v1"],
-                 ["--model", "file-prefix-v1"], ["--mode", "process", "--adapter", self.scenario])
+                 ["--model", "uninstalled-model"], ["--mode", "process", "--adapter", self.scenario])
         for n, extra in enumerate(cases):
             self.out = self.root / f"bad{n}"
             self.assertEqual(self.cli("test", self.scenario, "--out", self.out, *extra)[0], 2, extra)
