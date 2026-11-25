@@ -76,8 +76,14 @@ def main():
     shrink.add_argument("--candidate")
     shrink.add_argument("--ignore-runtime", action="store_true")
     shrink.add_argument("--worker-timeout", type=seconds, default=30.0, metavar="SECONDS")
+    inspect = commands.add_parser("inspect-trace", help="summarize storage events and crash-state search size")
+    inspect.add_argument("trace", type=Path, help="trace directory containing manifest.json and events.jsonl")
     args = parser.parse_args()
     try:
+        if args.command == "inspect-trace":
+            from .storage.inspect import summarize_trace
+            print(json.dumps(summarize_trace(args.trace.resolve()), sort_keys=True))
+            return 0
         if args.command in ("test", "run"):
             adapter = select_adapter(args.mode, args.adapter, args.model)
             result = run(args.scenario, args.out.resolve(), args.seed, args.max_candidates,

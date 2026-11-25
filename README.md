@@ -1,5 +1,10 @@
 # CrashCheck
 
+Storage engineers can inspect a recorded model trace without replaying every
+candidate: `python -m crashcheck inspect-trace storage-run/trace`. The JSON
+summary includes sync barriers and an upper bound on raw crash recipes; see
+`docs/storage_model.md` for the supported durability model and its limits.
+
 CrashCheck runs a SQLite application from a clean fixture, stops the process at a scenario marker and checks what a fresh process can recover. It requires Python 3.11+ and the core uses only the standard library. The reference environment is Linux.
 
 ## Run the booking example
@@ -13,6 +18,27 @@ python -m unittest discover -s tests -v
 ```
 
 `crashcheck run` is an alias of `crashcheck test`. The example intentionally commits a seat decrement before inserting its booking. Cuts after the seat update leave a missing seat, report `booking.capacity` and exit 1. Set `SPLIT_COMMIT = False` in a copy of the example to exercise the atomic control. All three cuts should pass.
+
+## Storage-engine model (APSW)
+
+The built-in `file-prefix-v1` adapter now records SQLite VFS file operations,
+checks byte-for-byte reconstruction of the final control state, explores
+per-file write prefixes constrained by completed sync barriers, and passes
+recovered snapshots to the existing verifier and failure-replay pipeline.
+
+```sh
+python -m pip install -r requirements-storage.txt
+python -m crashcheck test examples/booking.py --mode modeled \
+  --model file-prefix-v1 --seed 42 --max-candidates 100 --out storage-run
+```
+
+This is a **single-writer, rollback-journal DELETE + synchronous EXTRA +
+mmap_size=0** model. It is intentionally not a full power-loss simulator for
+every filesystem. The traced workload must use the supported SQLite connection
+API, and the all-kept replay check rejects incomplete captures. Unsupported
+WAL and other configurations are inconclusive, never silently accepted.
+For trace schema, precise persistence assumptions, adapter contract and test
+vectors, see [docs/storage_model.md](docs/storage_model.md).
 
 ## Commands
 
