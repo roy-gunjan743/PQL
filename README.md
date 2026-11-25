@@ -1,9 +1,34 @@
 # CrashCheck
 
-Storage engineers can inspect a recorded model trace without replaying every
-candidate: `python -m crashcheck inspect-trace storage-run/trace`. The JSON
-summary includes sync barriers and an upper bound on raw crash recipes; see
-`docs/storage_model.md` for the supported durability model and its limits.
+> **Active development branch:** `feat/storage-engineering` in [suryandugy-glitch/PQL](https://github.com/suryandugy-glitch/PQL). The `main` branch documents the process-testing baseline; this branch includes the experimental APSW VFS recorder and `file-prefix-v1` storage model.
+
+## What it does
+
+CrashCheck targets **application-level consistency bugs**, such as a booking decrement committed separately from its receipt. It captures candidate crash states, verifies SQLite integrity and application invariants in fresh workers, then saves reproducible failure evidence.
+
+| Component | Purpose |
+| --- | --- |
+| APSW VFS recorder | Capture completed SQLite file writes, truncations, syncs and journal effects. |
+| `file-prefix-v1` model | Construct per-file retained-effect prefixes respecting completed sync barriers. |
+| Verification workers | Reopen recovered candidates, run optional recovery and check invariants. |
+| Reports and bundles | Expose evidence, trace statistics, deterministic replay and minimization. |
+
+### Development line
+
+This branch implements basic APSW-based `file-prefix-v1` exploration and a read-only trace inspector. Seed-dependent per-boundary permutation and duplicate-boundary pruning were subsequently developed in the separate [PQL-Storage branch](https://github.com/suryandugy-glitch/PQL-Storage/tree/feat/storage-engineering); they are not claimed as part of this branch.
+
+**Model boundary:** Single-writer SQLite with rollback journal `DELETE`, `synchronous=EXTRA` and `mmap_size=0`. The model retains ordered per-file effect prefixes; it does not claim to simulate arbitrary write reordering, torn sectors, WAL, SSD cache behavior or all real power failures. Unsupported configurations are inconclusive.
+
+## Quick start
+
+```sh
+python -m pip install -r requirements-storage.txt
+python -m crashcheck test examples/booking.py --mode modeled --model file-prefix-v1 --seed 42 --max-candidates 100 --out storage-run
+python -m crashcheck inspect-trace storage-run/trace
+python -m unittest discover -s tests -q
+```
+
+The example intentionally contains a split transaction; inspect generated failures before using `replay` and `minimize`. Run the commands from the checkout root. `--max-candidates` controls the exploration budget rather than redefining the model's completeness.
 
 CrashCheck runs a SQLite application from a clean fixture, stops the process at a scenario marker and checks what a fresh process can recover. It requires Python 3.11+ and the core uses only the standard library. The reference environment is Linux.
 
